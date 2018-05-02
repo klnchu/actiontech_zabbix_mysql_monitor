@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	_ "github.com/go-sql-driver/mysql"
 	"io/ioutil"
 	"log"
 	"os"
@@ -15,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -39,6 +40,7 @@ var (
 	user              = flag.String("user", "", "`MySQL username` (default: no default)")
 	pass              = flag.String("pass", "", "`MySQL password` (default: no default)")
 	port              = flag.String("port", "3306", "`MySQL port`")
+	configPath        = flag.String("config_path", "/etc/mysql/my.cnf", "MySql config path")
 	pollTime          = flag.Int("poll_time", 30, "Adjust to match your `polling interval`.if change, make sure change the wrapper.sh file too.")
 	nocache           = flag.Bool("nocache", false, "Do not cache results in a file (default: false)")
 	items             = flag.String("items", "", "-items <`item`,...> Comma-separated list of the items whose data you want (default: no default)")
@@ -46,7 +48,7 @@ var (
 	cacheDir          = flag.String("cache_dir", "/tmp", "A `path` for saving cache. if change, make sure change the wrapper.sh file too.")
 	heartbeat         = flag.Bool("heartbeat", false, "Whether to use pt-heartbeat table for repl. delay calculation. (default: false)")
 	heartbeatUtc      = flag.Bool("heartbeat_utc", false, "Whether pt-heartbeat is run with --utc option. (default: false)")
-	heartbeatServerId = flag.String("heartbeat_server_id", "0", "`Server id` to associate with a heartbeat. Leave 0 if no preference. (default: 0)")
+	heartbeatServerID = flag.String("heartbeat_server_id", "0", "`Server id` to associate with a heartbeat. Leave 0 if no preference. (default: 0)")
 	heartbeatTable    = flag.String("heartbeat_table", "percona.heartbeat", "`db.tbl`.")
 	innodb            = flag.Bool("innodb", true, "Whether to check InnoDB statistics")
 	master            = flag.Bool("master", true, "Whether to check binary logging")
@@ -65,8 +67,10 @@ var (
 	regSpaces     = regexp.MustCompile("\\s+")
 	regNumbers    = regexp.MustCompile("\\d+")
 	regIndividual = regexp.MustCompile("(?s)INDIVIDUAL BUFFER POOL INFO.*ROW OPERATIONS")
+	regPassword   = regexp.MustCompile(`password*\s+=\s\w+`)
 
-	Version string
+	Version  string = "0.0.1"
+	Password string
 )
 
 func main() {
@@ -74,7 +78,7 @@ func main() {
 
 	if *version {
 		fmt.Println("version:", Version)
-		os.Exit(1)
+		os.Exit(0)
 	}
 
 	//debug file
@@ -108,9 +112,13 @@ func main() {
 
 	//param preprocessing
 	{
-		if *user == "" || *pass == "" {
-			fmt.Fprintln(os.Stderr, "Please set mysql user and password use --user= --pass= !")
-			log.Fatalln("flag user or pass is empty, exit !")
+		if *user == "" || *configPath == "" {
+			fmt.Fprintln(os.Stderr, "Please set mysql user and password use --user= --config_path= !")
+			log.Fatalln("flag user or configPath is empty, exit !")
+		}
+		Password = parseConfigPath(*configPath)
+		if Password == "" {
+			log.Fatalln("not found password")
 		}
 		*host = strings.Replace(*host, ":", "", -1)
 		*host = strings.Replace(*host, "/", "_", -1)
@@ -119,7 +127,7 @@ func main() {
 	// check cache
 	var cacheFile *os.File
 	{
-		cacheFilePath := *cacheDir + "/actiontech_" + *host + "_" + *port + "-mysql_zabbix_stats.txt"
+		cacheFilePath := *cacheDir + "/trove_" + *host + "_" + *port + "-mysql_zabbix_stats.txt"
 		log.Printf("cacheFilePath = %s\n", cacheFilePath)
 		if !(*nocache) {
 			var err error
@@ -139,20 +147,45 @@ func main() {
 		}
 	}
 
-	collectionExist, collectionInfo := collect()
+	collectionExist, collectionInfo := collect(Password)
 	result := parse(collectionExist, collectionInfo)
 	print(result, cacheFile)
 }
 
-func collect() ([]bool, []map[string]string) {
+func parseConfigPath(configPath string) (password string) {
+	inputFile, inputError := os.Open(configPath)
+	if inputError != nil {
+		log.Fatalln("read config file error.")
+		return
+	}
+	defer inputFile.Close()
+
+	fd, err := ioutil.ReadAll(inputFile)
+	if err != nil {
+		log.Fatalln("read config file content failured.")
+		return
+	}
+	configContent := string(fd)
+	result := regPassword.FindAllString(configContent, -1)
+	if len(result) <= 0 {
+		return
+	}
+	resultString := result[len(result)-1]
+	resultList := strings.Split(resultString, "= ")
+	password = resultList[len(resultList)-1]
+	password = strings.Replace(password, " ", "", -1)
+	return password
+}
+
+func collect(password string) ([]bool, []map[string]string) {
 	// Connect to MySQL.
 	var db *sql.DB
 	if mysqlSsl {
 		log.Println("// TODO: Use mysql ssl")
 	} else {
 		var err error
-		log.Printf("Connecting mysql: user %s, pass %s, host %s, port %s", *user, *pass, *host, *port)
-		db, err = sql.Open("mysql", *user+":"+*pass+"@tcp("+*host+":"+*port+")/")
+		log.Printf("Connecting mysql: user %s, pass %s, host %s, port %s", *user, Password, *host, *port)
+		db, err = sql.Open("mysql", *user+":"+Password+"@tcp("+*host+":"+*port+")/")
 		if nil != err {
 			log.Fatalf("sql.Open err:(%s) exit !", err)
 		}
@@ -741,7 +774,7 @@ func getDelayFromHeartbeat(db *sql.DB) map[string]string {
 	} else {
 		nowFunc = "UNIX_TIMESTAMP()"
 	}
-	query := fmt.Sprintf("SELECT MAX(%s - ROUND(UNIX_TIMESTAMP(ts))) AS delay FROM %s WHERE %s = 0 OR server_id = %s", nowFunc, *heartbeatTable, *heartbeatServerId, *heartbeatServerId)
+	query := fmt.Sprintf("SELECT MAX(%s - ROUND(UNIX_TIMESTAMP(ts))) AS delay FROM %s WHERE %s = 0 OR server_id = %s", nowFunc, *heartbeatTable, *heartbeatServerID, *heartbeatServerID)
 	result = collectFirstRowAsMapValue("delay_from_heartbeat", "delay", db, query)
 	return result
 }
@@ -1368,7 +1401,8 @@ func changeKeyCase(m map[string]string) map[string]string {
 }
 
 func discoveryMysqldPort() {
-	data := make([]map[string]string, 0)
+	// data := make([]map[string]string, 0)
+	var data []map[string]string
 	enc := json.NewEncoder(os.Stdout)
 	cmd := "netstat -ntlp |awk '/\\/mysqld[ $]/{print $4}'|awk -F ':' '{print $NF}'"
 	if *useSudo {
